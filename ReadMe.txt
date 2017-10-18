@@ -50,7 +50,7 @@ For running this project execute following steps.
 
 Tokenfile.txt Fileid.txt 5 10 10
 
-10.Enter -Xmx10240m in VM arguments(or memory you need if heap size/out of memory error occuers)
+10.Enter -Xmx10240m in VM arguments(or memory you need if heap size/out of memory error occurs)
 
 11.click Apply
 
