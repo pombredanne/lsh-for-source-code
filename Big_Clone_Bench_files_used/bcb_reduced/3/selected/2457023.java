@@ -1,0 +1,965 @@
+package com.jpeterson.littles3;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.Writer;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+import java.security.AccessControlException;
+import java.security.DigestOutputStream;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.text.SimpleDateFormat;
+import java.util.Enumeration;
+import java.util.Iterator;
+import java.util.List;
+import java.util.TimeZone;
+import javax.servlet.ServletException;
+import javax.servlet.ServletInputStream;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import org.apache.commons.codec.binary.Hex;
+import org.apache.commons.configuration.Configuration;
+import org.apache.commons.configuration.ConfigurationException;
+import org.apache.commons.configuration.PropertiesConfiguration;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+import org.springframework.dao.DataAccessException;
+import org.springframework.dao.DataRetrievalFailureException;
+import org.springframework.web.servlet.FrameworkServlet;
+import com.jpeterson.littles3.bo.Acp;
+import com.jpeterson.littles3.bo.AllUsersGroup;
+import com.jpeterson.littles3.bo.AuthenticatedUsersGroup;
+import com.jpeterson.littles3.bo.Authenticator;
+import com.jpeterson.littles3.bo.AuthenticatorException;
+import com.jpeterson.littles3.bo.Bucket;
+import com.jpeterson.littles3.bo.CanonicalUser;
+import com.jpeterson.littles3.bo.InvalidAccessKeyIdException;
+import com.jpeterson.littles3.bo.InvalidSecurityException;
+import com.jpeterson.littles3.bo.RequestTimeTooSkewedException;
+import com.jpeterson.littles3.bo.ResourcePermission;
+import com.jpeterson.littles3.bo.S3Object;
+import com.jpeterson.littles3.bo.SignatureDoesNotMatchException;
+import com.jpeterson.littles3.service.BucketAlreadyExistsException;
+import com.jpeterson.littles3.service.BucketNotEmptyException;
+import com.jpeterson.littles3.service.StorageService;
+import com.jpeterson.util.etag.ETag;
+import com.jpeterson.util.etag.FileETag;
+import com.jpeterson.util.http.Range;
+import com.jpeterson.util.http.RangeFactory;
+import com.jpeterson.util.http.RangeInputStream;
+import com.jpeterson.util.http.RangeSet;
+
+public class StorageEngine extends FrameworkServlet {
+
+    /**
+	 * 
+	 */
+    private static final long serialVersionUID = 1L;
+
+    /**
+	 * HTTP Header that can be used to override the actual method. Useful in
+	 * situations, for instance, where a firewall only allows "GET" AND "POST"
+	 * methods, but you need to use "PUT" and "DELETE" methods. You can specify
+	 * this HTTP header and the appropriate value.
+	 */
+    public static final String HEADER_HTTP_METHOD_OVERRIDE = "X-HTTP-Method-Override";
+
+    public static final String HEADER_PREFIX_USER_META = "x-amz-meta-";
+
+    private Log logger;
+
+    /**
+	 * Default configuration file name.
+	 */
+    public static final String DEFAULT_CONFIGURATION = "StorageEngine.properties";
+
+    /**
+	 * Configuration property defining the HTTP Host that this engine is
+	 * serving.
+	 */
+    public static final String CONFIG_HOST = "host";
+
+    /**
+	 * This token can be used in a <code>CONFIG_HOST</code> for the local host.
+	 * It is resolved via
+	 * <code>InetAddress.getLocalHost().getCanonicalHostName()</code>.
+	 */
+    public static final String CONFIG_HOST_TOKEN_RESOLVED_LOCAL_HOST = "$resolvedLocalHost$";
+
+    public static final String BEAN_AUTHENTICATOR = "authenticator";
+
+    public static final String BEAN_STORAGE_SERVICE = "storageService";
+
+    private ETag eTag;
+
+    private Configuration configuration;
+
+    private static SimpleDateFormat iso8601 = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'");
+
+    private static TimeZone utc = TimeZone.getTimeZone("UTC");
+
+    static {
+        iso8601.setTimeZone(utc);
+    }
+
+    private static final String HEADER_X_AMZ_ACL = "x-amz-acl";
+
+    private static final String ACL_PRIVATE = "private";
+
+    private static final String ACL_PUBLIC_READ = "public-read";
+
+    private static final String ACL_PUBLIC_READ_WRITE = "public-read-write";
+
+    private static final String ACL_AUTHENTICATED_READ = "authenticated-read";
+
+    private static final String PARAMETER_ACL = "acl";
+
+    /**
+	 * Basic constructor. Initializes the logger.
+	 */
+    public StorageEngine() {
+        super();
+        logger = LogFactory.getLog(this.getClass());
+    }
+
+    /**
+	 * Initialize the servlet.
+	 * 
+	 * @throws ServletException
+	 *             if an exception occurs that interrupts the servlet's normal
+	 *             operation
+	 */
+    public void initFrameworkServlet() throws ServletException {
+        FileETag eTag = new FileETag();
+        eTag.setFlags(FileETag.FLAG_CONTENT);
+        setETag(eTag);
+        try {
+            configuration = new PropertiesConfiguration(DEFAULT_CONFIGURATION);
+        } catch (ConfigurationException e) {
+            logger.warn("Unable to load default properties-based configuration: " + DEFAULT_CONFIGURATION);
+            configuration = new PropertiesConfiguration();
+        }
+    }
+
+    public void destroy() {
+        super.destroy();
+    }
+
+    /**
+	 * Get the ETag calculator.
+	 * 
+	 * @return The ETag calculator.
+	 */
+    public ETag getETag() {
+        return eTag;
+    }
+
+    /**
+	 * Set the ETag calculator.
+	 * 
+	 * @param eTag
+	 *            The ETag calculator.
+	 */
+    public void setETag(ETag eTag) {
+        this.eTag = eTag;
+    }
+
+    /**
+	 * Subclasses must implement this method to do the work of request handling,
+	 * receiving a centralized callback for GET, POST, PUT and DELETE.
+	 * 
+	 * @param request
+	 *            current HTTP request
+	 * @param response
+	 *            current HTTP response
+	 * @throws Exception
+	 *             in case of any kind of processing failure
+	 */
+    protected void doService(HttpServletRequest request, HttpServletResponse response) throws Exception {
+        String method;
+        method = getMethod(request);
+        logger.debug("Method: " + method);
+        if (method.equalsIgnoreCase("GET")) {
+            methodGet(request, response);
+        } else if (method.equalsIgnoreCase("HEAD")) {
+            methodHead(request, response);
+        } else if (method.equalsIgnoreCase("PUT")) {
+            methodPut(request, response);
+        } else if (method.equalsIgnoreCase("DELETE")) {
+            methodDelete(request, response);
+        }
+    }
+
+    /**
+	 * Returns the HTTP method of the request. Implements logic to allow an
+	 * "override" method, specified by the header
+	 * <code>HEADER_HTTP_METHOD_OVERRIDE</code>. If the override method is
+	 * provided, it takes precedence over the actual method derived from
+	 * <code>request.getMethod()</code>.
+	 * 
+	 * @param request
+	 *            The request being processed.
+	 * @return The method of the request.
+	 * @see #HEADER_HTTP_METHOD_OVERRIDE
+	 */
+    public static String getMethod(HttpServletRequest request) {
+        String method;
+        method = request.getHeader(HEADER_HTTP_METHOD_OVERRIDE);
+        if (method == null) {
+            method = request.getMethod();
+        }
+        return method;
+    }
+
+    /**
+	 * Metadata
+	 * 
+	 * @param req
+	 *            the request object that is passed to the servlet
+	 * @param resp
+	 *            the response object that the servlet uses to return the
+	 *            headers to the client
+	 * @throws IOException
+	 *             if an input or output error occurs
+	 * @throws ServletException
+	 *             if the request for the HEAD could not be handled
+	 */
+    public void methodHead(HttpServletRequest req, HttpServletResponse resp) throws ServletException, IOException {
+        processHeadGet(req, resp);
+    }
+
+    /**
+	 * Read
+	 * 
+	 * @param req
+	 *            an HttpServletRequest object that contains the request the
+	 *            client has made of the servlet
+	 * @param resp
+	 *            an HttpServletResponse object that contains the response the
+	 *            servlet sends to the client
+	 * @throws IOException
+	 *             if an input or output error is detected when the servlet
+	 *             handles the GET request
+	 * @throws ServletException
+	 *             if the request for the GET could not be handled
+	 */
+    public void methodGet(HttpServletRequest req, HttpServletResponse resp) throws ServletException, IOException {
+        processHeadGet(req, resp);
+    }
+
+    /**
+	 * Process HTTP HEAD and GET
+	 * 
+	 * @param req
+	 *            an HttpServletRequest object that contains the request the
+	 *            client has made of the servlet
+	 * @param resp
+	 *            an HttpServletResponse object that contains the response the
+	 *            servlet sends to the client
+	 * @throws IOException
+	 *             if an input or output error is detected when the servlet
+	 *             handles the GET request
+	 * @throws ServletException
+	 *             if the request for the GET could not be handled
+	 */
+    @SuppressWarnings("unchecked")
+    public void processHeadGet(HttpServletRequest req, HttpServletResponse resp) throws ServletException, IOException {
+        if (logger.isDebugEnabled()) {
+            logger.debug("Context path: " + req.getContextPath());
+            logger.debug("Path info: " + req.getPathInfo());
+            logger.debug("Path translated: " + req.getPathTranslated());
+            logger.debug("Query string: " + req.getQueryString());
+            logger.debug("Request URI: " + req.getRequestURI());
+            logger.debug("Request URL: " + req.getRequestURL());
+            logger.debug("Servlet path: " + req.getServletPath());
+            logger.debug("Servlet name: " + this.getServletName());
+            for (Enumeration headerNames = req.getHeaderNames(); headerNames.hasMoreElements(); ) {
+                String headerName = (String) headerNames.nextElement();
+                String headerValue = req.getHeader(headerName);
+                logger.debug("Header- " + headerName + ": " + headerValue);
+            }
+        }
+        try {
+            S3ObjectRequest or;
+            try {
+                or = S3ObjectRequest.create(req, resolvedHost(), (Authenticator) getWebApplicationContext().getBean(BEAN_AUTHENTICATOR));
+            } catch (InvalidAccessKeyIdException e) {
+                e.printStackTrace();
+                resp.sendError(HttpServletResponse.SC_FORBIDDEN, "InvalidAccessKeyId");
+                return;
+            } catch (InvalidSecurityException e) {
+                e.printStackTrace();
+                resp.sendError(HttpServletResponse.SC_FORBIDDEN, "InvalidSecurity");
+                return;
+            } catch (RequestTimeTooSkewedException e) {
+                e.printStackTrace();
+                resp.sendError(HttpServletResponse.SC_FORBIDDEN, "RequestTimeTooSkewed");
+                return;
+            } catch (SignatureDoesNotMatchException e) {
+                e.printStackTrace();
+                resp.sendError(HttpServletResponse.SC_FORBIDDEN, "SignatureDoesNotMatch");
+                return;
+            } catch (AuthenticatorException e) {
+                e.printStackTrace();
+                resp.sendError(HttpServletResponse.SC_FORBIDDEN, "InvalidSecurity");
+                return;
+            }
+            if (or.getKey() != null) {
+                S3Object s3Object;
+                StorageService storageService;
+                try {
+                    storageService = (StorageService) getWebApplicationContext().getBean(BEAN_STORAGE_SERVICE);
+                    s3Object = storageService.load(or.getBucket(), or.getKey());
+                    if (s3Object == null) {
+                        resp.sendError(HttpServletResponse.SC_NOT_FOUND, "NoSuchKey");
+                        return;
+                    }
+                } catch (DataAccessException e) {
+                    resp.sendError(HttpServletResponse.SC_NOT_FOUND, "NoSuchKey");
+                    return;
+                }
+                if (req.getParameter(PARAMETER_ACL) != null) {
+                    String response;
+                    Acp acp = s3Object.getAcp();
+                    try {
+                        acp.canRead(or.getRequestor());
+                    } catch (AccessControlException e) {
+                        resp.sendError(HttpServletResponse.SC_FORBIDDEN, "AccessDenied");
+                        return;
+                    }
+                    response = Acp.encode(acp);
+                    resp.setContentLength(response.length());
+                    resp.setContentType("application/xml");
+                    resp.setStatus(HttpServletResponse.SC_OK);
+                    Writer out = resp.getWriter();
+                    out.write(response);
+                    out.flush();
+                    out.close();
+                    out = null;
+                } else {
+                    InputStream in = null;
+                    OutputStream out = null;
+                    byte[] buffer = new byte[4096];
+                    int count;
+                    String value;
+                    try {
+                        s3Object.canRead(or.getRequestor());
+                    } catch (AccessControlException e) {
+                        resp.sendError(HttpServletResponse.SC_FORBIDDEN, "AccessDenied");
+                        return;
+                    }
+                    resp.setContentType(s3Object.getContentType());
+                    if ((value = s3Object.getContentDisposition()) != null) {
+                        resp.setHeader("Content-Disposition", value);
+                    }
+                    for (Iterator<String> names = s3Object.getMetadataNames(); names.hasNext(); ) {
+                        String name = names.next();
+                        String headerName = HEADER_PREFIX_USER_META + name;
+                        String prefix = "";
+                        StringBuffer buf = new StringBuffer();
+                        for (Iterator<String> values = s3Object.getMetadataValues(name); values.hasNext(); ) {
+                            buf.append(values.next()).append(prefix);
+                            prefix = ",";
+                        }
+                        resp.setHeader(headerName, buf.toString());
+                    }
+                    resp.setDateHeader("Last-Modified", s3Object.getLastModified());
+                    if ((value = s3Object.getETag()) != null) {
+                        resp.setHeader("ETag", value);
+                    }
+                    if ((value = s3Object.getContentMD5()) != null) {
+                        resp.setHeader("Content-MD5", value);
+                    }
+                    if ((value = s3Object.getContentDisposition()) != null) {
+                        resp.setHeader("Content-Disposition", value);
+                    }
+                    resp.setHeader("Accept-Ranges", "bytes");
+                    String rangeRequest = req.getHeader("Range");
+                    if (rangeRequest != null) {
+                        RangeSet rangeSet = RangeFactory.processRangeHeader(rangeRequest);
+                        rangeSet.resolve(s3Object.getContentLength());
+                        if (rangeSet.size() > 1) {
+                            resp.sendError(HttpServletResponse.SC_NOT_IMPLEMENTED);
+                        }
+                        Range[] ranges = (Range[]) rangeSet.toArray(new Range[0]);
+                        resp.setHeader("Content-Range", formatRangeHeaderValue(ranges[0], s3Object.getContentLength()));
+                        resp.setHeader("Content-Length", Long.toString(rangeSet.getLength()));
+                        in = new RangeInputStream(s3Object.getInputStream(), ranges[0]);
+                        resp.setStatus(HttpServletResponse.SC_PARTIAL_CONTENT);
+                    } else {
+                        resp.setHeader("Content-Length", Long.toString(s3Object.getContentLength()));
+                        in = s3Object.getInputStream();
+                        resp.setStatus(HttpServletResponse.SC_OK);
+                    }
+                    out = resp.getOutputStream();
+                    while ((count = in.read(buffer, 0, buffer.length)) > 0) {
+                        out.write(buffer, 0, count);
+                    }
+                    out.flush();
+                    out.close();
+                    out = null;
+                }
+                return;
+            } else if (or.getBucket() != null) {
+                StorageService storageService;
+                String prefix;
+                String marker;
+                int maxKeys = Integer.MAX_VALUE;
+                String delimiter;
+                String response;
+                String value;
+                storageService = (StorageService) getWebApplicationContext().getBean(BEAN_STORAGE_SERVICE);
+                if (req.getParameter(PARAMETER_ACL) != null) {
+                    Acp acp;
+                    try {
+                        acp = storageService.loadBucket(or.getBucket()).getAcp();
+                    } catch (DataAccessException e) {
+                        resp.sendError(HttpServletResponse.SC_NOT_FOUND, "NoSuchBucket");
+                        return;
+                    }
+                    try {
+                        acp.canRead(or.getRequestor());
+                    } catch (AccessControlException e) {
+                        resp.sendError(HttpServletResponse.SC_FORBIDDEN, "AccessDenied");
+                        return;
+                    }
+                    response = Acp.encode(acp);
+                    resp.setContentLength(response.length());
+                    resp.setContentType("application/xml");
+                    resp.setStatus(HttpServletResponse.SC_OK);
+                    Writer out = resp.getWriter();
+                    out.write(response);
+                    out.flush();
+                    out.close();
+                    out = null;
+                } else {
+                    Bucket bucket;
+                    prefix = req.getParameter("prefix");
+                    if (prefix == null) {
+                        prefix = "";
+                    }
+                    marker = req.getParameter("marker");
+                    value = req.getParameter("max-keys");
+                    if (value != null) {
+                        try {
+                            maxKeys = Integer.parseInt(value);
+                        } catch (NumberFormatException e) {
+                            logger.info("max-keys must be numeric: " + value);
+                        }
+                    }
+                    delimiter = req.getParameter("delimiter");
+                    try {
+                        bucket = storageService.loadBucket(or.getBucket());
+                    } catch (DataAccessException e) {
+                        resp.sendError(HttpServletResponse.SC_NOT_FOUND, "NoSuchBucket");
+                        return;
+                    }
+                    try {
+                        bucket.canRead(or.getRequestor());
+                    } catch (AccessControlException e) {
+                        resp.sendError(HttpServletResponse.SC_FORBIDDEN, "AccessDenied");
+                        return;
+                    }
+                    response = storageService.listKeys(bucket, prefix, marker, delimiter, maxKeys);
+                    resp.setContentLength(response.length());
+                    resp.setContentType("application/xml");
+                    resp.setStatus(HttpServletResponse.SC_OK);
+                    Writer out = resp.getWriter();
+                    out.write(response);
+                    if (logger.isTraceEnabled()) {
+                        logger.trace("Response: " + response);
+                    }
+                }
+                return;
+            } else {
+                StorageService storageService;
+                List buckets;
+                storageService = (StorageService) getWebApplicationContext().getBean(BEAN_STORAGE_SERVICE);
+                buckets = storageService.findBuckets("");
+                StringBuffer buffer = new StringBuffer();
+                buffer.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+                buffer.append("<ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
+                buffer.append("<Owner>");
+                buffer.append("<ID/>");
+                buffer.append("<DisplayName/>");
+                buffer.append("</Owner>");
+                buffer.append("<Buckets>");
+                for (Iterator iter = buckets.iterator(); iter.hasNext(); ) {
+                    Bucket bucket = (Bucket) iter.next();
+                    buffer.append("<Bucket>");
+                    buffer.append("<Name>").append(bucket.getName()).append("</Name>");
+                    buffer.append("<CreationDate>").append(iso8601.format(bucket.getCreated())).append("</CreationDate>");
+                    buffer.append("</Bucket>");
+                }
+                buffer.append("</Buckets>");
+                buffer.append("</ListAllMyBucketsResult>");
+                resp.setContentLength(buffer.length());
+                resp.setContentType("application/xml");
+                resp.setStatus(HttpServletResponse.SC_OK);
+                Writer out = resp.getWriter();
+                out.write(buffer.toString());
+                return;
+            }
+        } catch (IllegalArgumentException e) {
+            resp.sendError(HttpServletResponse.SC_BAD_REQUEST, "InvalidURI");
+            return;
+        }
+    }
+
+    /**
+	 * Write
+	 * 
+	 * @param req
+	 *            the HttpServletRequest object that contains the request the
+	 *            client made of the servlet
+	 * @param resp
+	 *            the HttpServletResponse object that contains the response the
+	 *            servlet returns to the client
+	 * @throws IOException
+	 *             if an input or output error occurs while the servlet is
+	 *             handling the PUT request
+	 * @throws ServletException
+	 *             if the request for the PUT cannot be handled
+	 */
+    @SuppressWarnings("unchecked")
+    public void methodPut(HttpServletRequest req, HttpServletResponse resp) throws ServletException, IOException {
+        OutputStream out = null;
+        try {
+            S3ObjectRequest or;
+            try {
+                or = S3ObjectRequest.create(req, resolvedHost(), (Authenticator) getWebApplicationContext().getBean(BEAN_AUTHENTICATOR));
+            } catch (InvalidAccessKeyIdException e) {
+                e.printStackTrace();
+                resp.sendError(HttpServletResponse.SC_FORBIDDEN, "InvalidAccessKeyId");
+                return;
+            } catch (InvalidSecurityException e) {
+                e.printStackTrace();
+                resp.sendError(HttpServletResponse.SC_FORBIDDEN, "InvalidSecurity");
+                return;
+            } catch (RequestTimeTooSkewedException e) {
+                e.printStackTrace();
+                resp.sendError(HttpServletResponse.SC_FORBIDDEN, "RequestTimeTooSkewed");
+                return;
+            } catch (SignatureDoesNotMatchException e) {
+                e.printStackTrace();
+                resp.sendError(HttpServletResponse.SC_FORBIDDEN, "SignatureDoesNotMatch");
+                return;
+            } catch (AuthenticatorException e) {
+                e.printStackTrace();
+                resp.sendError(HttpServletResponse.SC_FORBIDDEN, "InvalidSecurity");
+                return;
+            }
+            logger.debug("S3ObjectRequest: " + or);
+            CanonicalUser requestor = or.getRequestor();
+            if (or.getKey() != null) {
+                String value;
+                long contentLength;
+                MessageDigest messageDigest = MessageDigest.getInstance("MD5");
+                DigestOutputStream digestOutputStream = null;
+                S3Object oldS3Object = null;
+                S3Object s3Object;
+                StorageService storageService;
+                Bucket bucket;
+                String bucketName = or.getBucket();
+                String key = or.getKey();
+                if (!isValidKey(key)) {
+                    resp.sendError(HttpServletResponse.SC_BAD_REQUEST, "KeyTooLong");
+                    return;
+                }
+                storageService = (StorageService) getWebApplicationContext().getBean(BEAN_STORAGE_SERVICE);
+                if (req.getParameter(PARAMETER_ACL) != null) {
+                    Acp acp;
+                    CanonicalUser owner;
+                    s3Object = storageService.load(bucketName, key);
+                    if (s3Object == null) {
+                        resp.sendError(HttpServletResponse.SC_NOT_FOUND, "NoSuchKey");
+                        return;
+                    }
+                    acp = s3Object.getAcp();
+                    try {
+                        acp.canWrite(requestor);
+                    } catch (AccessControlException e) {
+                        resp.sendError(HttpServletResponse.SC_FORBIDDEN, "AccessDenied");
+                        return;
+                    }
+                    owner = acp.getOwner();
+                    try {
+                        acp = Acp.decode(req.getInputStream());
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                        resp.sendError(HttpServletResponse.SC_BAD_REQUEST, "MalformedACLError");
+                        return;
+                    }
+                    acp.setOwner(owner);
+                    s3Object.setAcp(acp);
+                    storageService.store(s3Object);
+                } else {
+                    try {
+                        bucket = storageService.loadBucket(bucketName);
+                        bucket.canWrite(requestor);
+                    } catch (AccessControlException e) {
+                        resp.sendError(HttpServletResponse.SC_FORBIDDEN, "AccessDenied");
+                        return;
+                    } catch (DataAccessException e) {
+                        resp.sendError(HttpServletResponse.SC_NOT_FOUND, "NoSuchBucket");
+                        return;
+                    }
+                    try {
+                        oldS3Object = storageService.load(bucket.getName(), key);
+                    } catch (DataRetrievalFailureException e) {
+                    }
+                    try {
+                        s3Object = storageService.createS3Object(bucket, key, requestor);
+                    } catch (DataAccessException e) {
+                        resp.sendError(HttpServletResponse.SC_NOT_FOUND, "NoSuchBucket");
+                        return;
+                    }
+                    out = s3Object.getOutputStream();
+                    digestOutputStream = new DigestOutputStream(out, messageDigest);
+                    value = req.getHeader("Content-Length");
+                    if (value == null) {
+                        resp.sendError(HttpServletResponse.SC_LENGTH_REQUIRED, "MissingContentLength");
+                        return;
+                    }
+                    contentLength = Long.valueOf(value).longValue();
+                    if (contentLength > 5368709120L) {
+                        resp.sendError(HttpServletResponse.SC_BAD_REQUEST, "EntityTooLarge");
+                        return;
+                    }
+                    long written = 0;
+                    int count;
+                    byte[] b = new byte[4096];
+                    ServletInputStream in = req.getInputStream();
+                    while (((count = in.read(b, 0, b.length)) > 0) && (written < contentLength)) {
+                        digestOutputStream.write(b, 0, count);
+                        written += count;
+                    }
+                    digestOutputStream.flush();
+                    if (written != contentLength) {
+                        if (out != null) {
+                            out.close();
+                            out = null;
+                        }
+                        if (digestOutputStream != null) {
+                            digestOutputStream.close();
+                            digestOutputStream = null;
+                        }
+                        storageService.remove(s3Object);
+                        resp.sendError(HttpServletResponse.SC_BAD_REQUEST, "IncompleteBody");
+                        return;
+                    }
+                    s3Object.setContentDisposition(req.getHeader("Content-Disposition"));
+                    s3Object.setContentLength(contentLength);
+                    s3Object.setContentMD5(req.getHeader("Content-MD5"));
+                    value = req.getContentType();
+                    logger.debug("Put - Content-Type: " + value);
+                    if (value == null) {
+                        value = S3Object.DEFAULT_CONTENT_TYPE;
+                    }
+                    s3Object.setContentType(value);
+                    logger.debug("Put - get content-type: " + s3Object.getContentType());
+                    s3Object.setLastModified(System.currentTimeMillis());
+                    int prefixLength = HEADER_PREFIX_USER_META.length();
+                    String name;
+                    for (Enumeration headerNames = req.getHeaderNames(); headerNames.hasMoreElements(); ) {
+                        String headerName = (String) headerNames.nextElement();
+                        if (headerName.startsWith(HEADER_PREFIX_USER_META)) {
+                            name = headerName.substring(prefixLength).toLowerCase();
+                            for (Enumeration headers = req.getHeaders(headerName); headers.hasMoreElements(); ) {
+                                value = (String) headers.nextElement();
+                                s3Object.addMetadata(name, value);
+                            }
+                        }
+                    }
+                    value = new String(Hex.encodeHex(digestOutputStream.getMessageDigest().digest()));
+                    resp.setHeader("ETag", value);
+                    s3Object.setETag(value);
+                    grantCannedAccessPolicies(req, s3Object.getAcp(), requestor);
+                    if (oldS3Object != null) {
+                        storageService.remove(oldS3Object);
+                    }
+                    storageService.store(s3Object);
+                }
+            } else if (or.getBucket() != null) {
+                StorageService storageService;
+                Bucket bucket;
+                storageService = (StorageService) getWebApplicationContext().getBean(BEAN_STORAGE_SERVICE);
+                if (req.getParameter(PARAMETER_ACL) != null) {
+                    Acp acp;
+                    CanonicalUser owner;
+                    logger.debug("User is providing new ACP for bucket " + or.getBucket());
+                    try {
+                        bucket = storageService.loadBucket(or.getBucket());
+                    } catch (DataAccessException e) {
+                        resp.sendError(HttpServletResponse.SC_NOT_FOUND, "NoSuchBucket");
+                        return;
+                    }
+                    acp = bucket.getAcp();
+                    try {
+                        acp.canWrite(requestor);
+                    } catch (AccessControlException e) {
+                        resp.sendError(HttpServletResponse.SC_FORBIDDEN, "AccessDenied");
+                        return;
+                    }
+                    owner = acp.getOwner();
+                    try {
+                        acp = Acp.decode(req.getInputStream());
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                        resp.sendError(HttpServletResponse.SC_BAD_REQUEST, "MalformedACLError");
+                        return;
+                    }
+                    acp.setOwner(owner);
+                    bucket.setAcp(acp);
+                    logger.debug("Saving bucket ACP");
+                    logger.debug("ACP: " + Acp.encode(bucket.getAcp()));
+                    storageService.storeBucket(bucket);
+                } else {
+                    String bucketName = or.getBucket();
+                    if (!isValidBucketName(bucketName)) {
+                        resp.sendError(HttpServletResponse.SC_BAD_REQUEST, "InvalidBucketName");
+                        return;
+                    }
+                    try {
+                        bucket = storageService.createBucket(bucketName, requestor);
+                    } catch (BucketAlreadyExistsException e) {
+                        resp.sendError(HttpServletResponse.SC_CONFLICT, "BucketAlreadyExists");
+                        return;
+                    }
+                    grantCannedAccessPolicies(req, bucket.getAcp(), requestor);
+                    storageService.storeBucket(bucket);
+                }
+            }
+        } catch (NoSuchAlgorithmException e) {
+            e.printStackTrace();
+            logger.error("Unable to use MD5", e);
+            resp.sendError(HttpServletResponse.SC_INTERNAL_SERVER_ERROR, "InternalError");
+        } catch (IOException e) {
+            e.printStackTrace();
+            throw e;
+        } finally {
+            if (out != null) {
+                out.close();
+                out = null;
+            }
+        }
+    }
+
+    /**
+	 * Delete
+	 * 
+	 * @param req
+	 *            the HttpServletRequest object that contains the request the
+	 *            client made of the servlet
+	 * @param resp
+	 *            the HttpServletResponse object that contains the response the
+	 *            servlet returns to the client
+	 * @param IOException
+	 *            if an input or output error occurs while the servlet is
+	 *            handling the DELETE request
+	 * @param ServletException
+	 *            if the request for the DELETE cannot be handled
+	 */
+    public void methodDelete(HttpServletRequest req, HttpServletResponse resp) throws ServletException, IOException {
+        S3ObjectRequest or;
+        try {
+            or = S3ObjectRequest.create(req, resolvedHost(), (Authenticator) getWebApplicationContext().getBean(BEAN_AUTHENTICATOR));
+        } catch (InvalidAccessKeyIdException e) {
+            e.printStackTrace();
+            resp.sendError(HttpServletResponse.SC_FORBIDDEN, "InvalidAccessKeyId");
+            return;
+        } catch (InvalidSecurityException e) {
+            e.printStackTrace();
+            resp.sendError(HttpServletResponse.SC_FORBIDDEN, "InvalidSecurity");
+            return;
+        } catch (RequestTimeTooSkewedException e) {
+            e.printStackTrace();
+            resp.sendError(HttpServletResponse.SC_FORBIDDEN, "RequestTimeTooSkewed");
+            return;
+        } catch (SignatureDoesNotMatchException e) {
+            e.printStackTrace();
+            resp.sendError(HttpServletResponse.SC_FORBIDDEN, "SignatureDoesNotMatch");
+            return;
+        } catch (AuthenticatorException e) {
+            e.printStackTrace();
+            resp.sendError(HttpServletResponse.SC_FORBIDDEN, "InvalidSecurity");
+            return;
+        }
+        logger.debug("S3ObjectRequest: " + or);
+        CanonicalUser requestor = or.getRequestor();
+        if (or.getKey() != null) {
+            Bucket bucket;
+            S3Object s3Object;
+            StorageService storageService;
+            storageService = (StorageService) getWebApplicationContext().getBean(BEAN_STORAGE_SERVICE);
+            try {
+                bucket = storageService.loadBucket(or.getBucket());
+                bucket.canWrite(requestor);
+            } catch (AccessControlException e) {
+                resp.sendError(HttpServletResponse.SC_FORBIDDEN, "AccessDenied");
+                return;
+            } catch (DataAccessException e) {
+                resp.sendError(HttpServletResponse.SC_NOT_FOUND, "NoSuchBucket");
+                return;
+            }
+            try {
+                s3Object = storageService.load(bucket.getName(), or.getKey());
+            } catch (DataRetrievalFailureException e) {
+                resp.sendError(HttpServletResponse.SC_NOT_FOUND, "NoSuchKey");
+                return;
+            }
+            storageService.remove(s3Object);
+            resp.setStatus(HttpServletResponse.SC_NO_CONTENT);
+            return;
+        } else if (or.getBucket() != null) {
+            StorageService storageService;
+            Bucket bucket;
+            String bucketName = or.getBucket();
+            storageService = (StorageService) getWebApplicationContext().getBean(BEAN_STORAGE_SERVICE);
+            try {
+                bucket = storageService.loadBucket(bucketName);
+            } catch (DataAccessException e) {
+                resp.sendError(HttpServletResponse.SC_NOT_FOUND, "NoSuchBucket");
+                return;
+            }
+            if (!requestor.equals(bucket.getAcp().getOwner())) {
+                resp.sendError(HttpServletResponse.SC_FORBIDDEN, "AccessDenied");
+                return;
+            }
+            try {
+                storageService.deleteBucket(bucket);
+            } catch (BucketNotEmptyException e) {
+                resp.sendError(HttpServletResponse.SC_CONFLICT, "BucketNotEmpty");
+                return;
+            }
+            resp.setStatus(HttpServletResponse.SC_NO_CONTENT);
+            return;
+        }
+        resp.sendError(HttpServletResponse.SC_NOT_IMPLEMENTED);
+    }
+
+    public static String formatRangeHeaderValue(Range range, long absoluteLength) {
+        StringBuffer buffer = new StringBuffer();
+        buffer.append("bytes ");
+        buffer.append(range.getStart());
+        buffer.append("-");
+        buffer.append(range.getEnd());
+        buffer.append("/");
+        buffer.append(absoluteLength);
+        return buffer.toString();
+    }
+
+    /**
+	 * Validates a bucket name. Bucket names can only contain alphanumeric
+	 * characters, underscore (_), period (.), and dash(-). Bucket names must be
+	 * between 3 and 255 characters long.
+	 * 
+	 * @param name
+	 *            The name of the bucket.
+	 * @return <code>True</code> if the bucket name is valid, <code>false</code>
+	 *         otherwise.
+	 */
+    public static boolean isValidBucketName(String name) {
+        if (name == null) {
+            return false;
+        }
+        char[] chars = name.toCharArray();
+        if ((chars.length < 3) || (chars.length > 255)) {
+            return false;
+        }
+        for (int i = 0; i < chars.length; i++) {
+            if ((chars[i] >= 'a') && (chars[i] <= 'z')) {
+                return true;
+            }
+            if ((chars[i] >= 'A') && (chars[i] <= 'Z')) {
+                return true;
+            }
+            if ((chars[i] >= '0') && (chars[i] <= '9')) {
+                return true;
+            }
+            if (chars[i] == '_') {
+                return true;
+            }
+            if (chars[i] == '.') {
+                return true;
+            }
+            if (chars[i] == '-') {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+	 * Validates a key. A key can be at most 1024 bytes long.
+	 * 
+	 * @param name
+	 *            The key.
+	 * @return <code>True</code> if the key is valid, <code>false</code>
+	 *         otherwise.
+	 */
+    public static boolean isValidKey(String name) {
+        if (name.length() > 1024) {
+            return false;
+        }
+        return true;
+    }
+
+    /**
+	 * Grant the canned access policies for buckets or objects as part of a
+	 * <code>PUT</code> operation. The canned access policies are specified in
+	 * the Amazon S3 Developer Guide.
+	 * 
+	 * @param acp
+	 *            The Access Control Policy to grant the canned access policies
+	 *            to.
+	 * @param owner
+	 *            The principal making the request who is the owner of the
+	 *            resource.
+	 */
+    public static void grantCannedAccessPolicies(HttpServletRequest req, Acp acp, CanonicalUser owner) {
+        String xAmzAcl;
+        xAmzAcl = req.getHeader(HEADER_X_AMZ_ACL);
+        if ((xAmzAcl == null) || (xAmzAcl.equals(ACL_PRIVATE))) {
+            acp.grant(owner, ResourcePermission.ACTION_FULL_CONTROL);
+        } else if (xAmzAcl.equals(ACL_PUBLIC_READ)) {
+            acp.grant(owner, ResourcePermission.ACTION_FULL_CONTROL);
+            acp.grant(AllUsersGroup.getInstance(), ResourcePermission.ACTION_READ);
+        } else if (xAmzAcl.equals(ACL_PUBLIC_READ_WRITE)) {
+            acp.grant(owner, ResourcePermission.ACTION_FULL_CONTROL);
+            acp.grant(AllUsersGroup.getInstance(), ResourcePermission.ACTION_READ);
+            acp.grant(AllUsersGroup.getInstance(), ResourcePermission.ACTION_WRITE);
+        } else if (xAmzAcl.equals(ACL_AUTHENTICATED_READ)) {
+            acp.grant(owner, ResourcePermission.ACTION_FULL_CONTROL);
+            acp.grant(AuthenticatedUsersGroup.getInstance(), ResourcePermission.ACTION_READ);
+        }
+    }
+
+    /**
+	 * Resolves the configured host name, replacing any tokens in the configured
+	 * host name value.
+	 * 
+	 * @return The configured host name after any tokens have been replaced.
+	 * @see #CONFIG_HOST
+	 * @see #CONFIG_HOST_TOKEN_RESOLVED_LOCAL_HOST
+	 */
+    public String resolvedHost() {
+        String configHost;
+        configHost = configuration.getString(CONFIG_HOST);
+        logger.debug("configHost: " + configHost);
+        if (configHost.indexOf(CONFIG_HOST_TOKEN_RESOLVED_LOCAL_HOST) >= 0) {
+            InetAddress localHost;
+            String resolvedLocalHost = "localhost";
+            try {
+                localHost = InetAddress.getLocalHost();
+                resolvedLocalHost = localHost.getCanonicalHostName();
+            } catch (UnknownHostException e) {
+                logger.fatal("Unable to resolve local host", e);
+            }
+            configHost = configHost.replace(CONFIG_HOST_TOKEN_RESOLVED_LOCAL_HOST, resolvedLocalHost);
+        }
+        return configHost;
+    }
+}
